@@ -61,6 +61,11 @@ var _ = Describe("GPU", func() {
 			Key:      v1alpha2.LabelSKUFamily,
 			Operator: v1.NodeSelectorOpExists,
 		})
+		test.ReplaceRequirements(nodePool, v1.NodeSelectorRequirement{
+			Key:      v1.LabelInstanceTypeStable,
+			Operator: v1.NodeSelectorOpExists,
+			Values:   []string{"Standard_NC4as_T4_v3"},
+		})
 		// exclude some of the more expensive GPU SKUs
 		nodePool.Spec.Limits = corev1beta1.Limits{
 			v1.ResourceCPU:                    resource.MustParse("25"),
@@ -148,7 +153,8 @@ var _ = Describe("GPU", func() {
 		}
 		env.ExpectCreated(nodeClass, nodePool, deployment, devicePlugin)
 		// This test exercises the full lifecycle of the GPU Node, and validates it can successfully schedule GPU Resources.
-		env.EventuallyExpectHealthyPodCountWithTimeout(time.Minute*15, labels.SelectorFromSet(deployment.Spec.Selector.MatchLabels), int(*deployment.Spec.Replicas))
+		// the Time.Minute 45 gives the test 3 tries to provision and bootstrap the node successfully
+		env.EventuallyExpectHealthyPodCountWithTimeout(time.Minute*45, labels.SelectorFromSet(deployment.Spec.Selector.MatchLabels), int(*deployment.Spec.Replicas))
 		env.ExpectCreatedNodeCount("==", int(*deployment.Spec.Replicas))
 
 	})
