@@ -85,6 +85,14 @@ func (env *Environment) DefaultNodePool(nodeClass *v1alpha2.AKSNodeClass) *corev
 		v1.ResourceCPU:    resource.MustParse("100"),
 		v1.ResourceMemory: resource.MustParse("1000Gi"),
 	})
+
+	nodePool.Spec.Template.Spec.StartupTaints = []v1.Taint{
+		{
+			Key:    "node.cilium.io/agent-not-ready",
+			Value:  "true",
+			Effect: v1.TaintEffectNoExecute,
+		},
+	}
 	return nodePool
 }
 
