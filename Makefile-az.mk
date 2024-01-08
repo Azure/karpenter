@@ -10,7 +10,12 @@ endif
 AZURE_CLUSTER_NAME ?= karpenter
 AZURE_RESOURCE_GROUP_MC = MC_$(AZURE_RESOURCE_GROUP)_$(AZURE_CLUSTER_NAME)_$(AZURE_LOCATION)
 
-az-all:         az-login az-mkaks-cilium	az-perm	az-patch-skaffold-azureoverlay	az-build az-run az-run-sample ## Provision the infra (ACR,AKS); build and deploy Karpenter; deploy sample Provisioner and workload
+KARPENTER_NAMESPACE ?= karpenter
+KARPENTER_SERVICE_ACCOUNT_NAME ?= karpenter-sa
+AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME ?= karpentermsi
+KARPENTER_FEDERATED_IDENTITY_CREDENTIAL_NAME ?= KARPENTER_FID 
+
+az-all:         az-login az-mkaks-cilium az-create-karpenter-msi az-create-federate-creds az-perm az-perm-acr az-patch-skaffold-azureoverlay az-build az-run az-run-sample ## Provision the infra (ACR,AKS); build and deploy Karpenter; deploy sample Provisioner and workload
 az-all-savm:    az-login az-mkaks-savm	az-perm az-patch-skaffold-azure	az-build az-run az-run-sample ## Provision the infra (ACR,AKS); build and deploy Karpenter; deploy sample Provisioner and workload - StandaloneVirtualMachines
 
 az-login: ## Login into Azure
@@ -32,9 +37,18 @@ az-mkaks: az-mkacr ## Create test AKS cluster (with --vm-set-type AvailabilitySe
 
 az-mkaks-cilium: az-mkacr ## Create test AKS cluster (with --network-dataplane cilium, --network-plugin cilium, and --network-plugin-mode overlay)
 	az aks create          --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --attach-acr $(AZURE_ACR_NAME) \
-		--enable-managed-identity --node-count 3 --generate-ssh-keys -o none --network-dataplane cilium --network-plugin azure --network-plugin-mode overlay
+		--enable-managed-identity --node-count 3 --generate-ssh-keys -o none --network-dataplane cilium --network-plugin azure --network-plugin-mode overlay \
+		--enable-oidc-issuer --enable-workload-identity
 	az aks get-credentials --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --overwrite-existing
 	skaffold config set default-repo $(AZURE_ACR_NAME).azurecr.io/karpenter
+
+az-create-karpenter-msi:
+	az identity create --name "${AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME}" --resource-group "${AZURE_RESOURCE_GROUP}" --location "${AZURE_LOCATION}" --subscription "${AZURE_SUBSCRIPTION_ID}"
+
+az-create-federate-creds:
+	$(eval AKS_OIDC_ISSUER=$(shell az aks show -n "${AZURE_CLUSTER_NAME}" -g "${AZURE_RESOURCE_GROUP}" --query "oidcIssuerProfile.issuerUrl" -otsv))
+
+	az identity federated-credential create --name ${KARPENTER_FEDERATED_IDENTITY_CREDENTIAL_NAME} --identity-name "${AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME}" --resource-group "${AZURE_RESOURCE_GROUP}" --issuer "${AKS_OIDC_ISSUER}" --subject system:serviceaccount:"${KARPENTER_NAMESPACE}":"${KARPENTER_SERVICE_ACCOUNT_NAME}" --audience api://AzureADTokenExchange
 
 az-mkaks-savm: az-mkrg ## Create experimental cluster with standalone VMs (+ ACR)
 	az deployment group create --resource-group $(AZURE_RESOURCE_GROUP) --template-file hack/azure/aks-savm.bicep --parameters aksname=$(AZURE_CLUSTER_NAME) acrname=$(AZURE_ACR_NAME)
@@ -45,7 +59,7 @@ az-rmrg: ## Destroy test ACR and AKS cluster by deleting the resource group (use
 	az group delete --name $(AZURE_RESOURCE_GROUP)
 
 az-patch-skaffold: 	## Update Azure client env vars and settings in skaffold config
-	$(eval AZURE_CLIENT_ID=$(shell az aks show --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) | jq -r ".identityProfile.kubeletidentity.clientId"))
+	$(eval KARPENTER_USER_ASSIGNED_CLIENT_ID=$(shell az identity show --resource-group "${AZURE_RESOURCE_GROUP}" --name "${AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME}" --query 'clientId' -otsv))
 	$(eval CLUSTER_ENDPOINT=$(shell kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'))
 	# bootstrap token
 	$(eval TOKEN_SECRET_NAME=$(shell kubectl get -n kube-system secrets --field-selector=type=bootstrap.kubernetes.io/token -o jsonpath='{.items[0].metadata.name}'))
@@ -56,13 +70,18 @@ az-patch-skaffold: 	## Update Azure client env vars and settings in skaffold con
 	$(eval SSH_PUBLIC_KEY=$(shell cat ~/.ssh/id_rsa.pub) azureuser)
 	yq -i '(.manifests.helm.releases[0].overrides.controller.env[] | select(.name=="ARM_SUBSCRIPTION_ID"))           .value = "$(AZURE_SUBSCRIPTION_ID)"'   skaffold.yaml
 	yq -i '(.manifests.helm.releases[0].overrides.controller.env[] | select(.name=="LOCATION"))                      .value = "$(AZURE_LOCATION)"'          skaffold.yaml
-	yq -i '(.manifests.helm.releases[0].overrides.controller.env[] | select(.name=="ARM_USER_ASSIGNED_IDENTITY_ID")) .value = "$(AZURE_CLIENT_ID)"'         skaffold.yaml
+	yq -i '(.manifests.helm.releases[0].overrides.controller.env[] | select(.name=="ARM_USER_ASSIGNED_IDENTITY_ID")) .value = "$(KARPENTER_USER_ASSIGNED_CLIENT_ID)"'         skaffold.yaml
 	yq -i '(.manifests.helm.releases[0].overrides.controller.env[] | select(.name=="AZURE_NODE_RESOURCE_GROUP"))     .value = "$(AZURE_RESOURCE_GROUP_MC)"' skaffold.yaml
 	yq -i  '.manifests.helm.releases[0].overrides.settings.azure.clusterName =                                                "$(AZURE_CLUSTER_NAME)"'      skaffold.yaml
 	yq -i  '.manifests.helm.releases[0].overrides.settings.azure.clusterEndpoint =                                            "$(CLUSTER_ENDPOINT)"'        skaffold.yaml
 	yq -i  '.manifests.helm.releases[0].overrides.settings.azure.networkPlugin =                                              "azure"'                      skaffold.yaml
 	yq -i  '.manifests.helm.releases[0].overrides.settings.azure.kubeletClientTLSBootstrapToken =                             "$(BOOTSTRAP_TOKEN)"'         skaffold.yaml
 	yq -i  '.manifests.helm.releases[0].overrides.settings.azure.sshPublicKey =                                               "$(SSH_PUBLIC_KEY)"'          skaffold.yaml
+
+	yq -i  '.manifests.helm.releases[0].overrides.serviceAccount.annotations."azure.workload.identity/client-id" = "$(KARPENTER_USER_ASSIGNED_CLIENT_ID)"' skaffold.yaml
+	yq -i  '.manifests.helm.releases[0].overrides.serviceAccount.name = "$(KARPENTER_SERVICE_ACCOUNT_NAME)"' skaffold.yaml
+
+	yq -i  '.manifests.helm.releases[0].overrides.podLabels ."azure.workload.identity/use" = "true"' skaffold.yaml
 
 az-patch-skaffold-kubenet: az-patch-skaffold	az-fetch-network-info
 	$(eval AZURE_SUBNET_ID=$(shell az network vnet list --resource-group $(AZURE_RESOURCE_GROUP_MC) | jq  -r ".[0].subnets[0].id"))
@@ -92,18 +111,18 @@ az-rmvmss-vms: ## Delete all VMs in VMSS Flex (use with care!)
 	az vmss delete-instances --name $(AZURE_CLUSTER_NAME)-vmss --resource-group $(AZURE_RESOURCE_GROUP_MC) --instance-ids '*'
 
 az-perm: ## Create role assignments to let Karpenter manage VMs and Network
-	# Note (charliedmcb): need to be objectId for E2E workflow as the pipeline identity doesn't have permissions to "query Graph API"
-	$(eval AZURE_OBJECT_ID=$(shell az aks show --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) | jq  -r ".identityProfile.kubeletidentity.objectId"))
-	az role assignment create --assignee $(AZURE_OBJECT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP_MC) --role "Virtual Machine Contributor"
-	az role assignment create --assignee $(AZURE_OBJECT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP_MC) --role "Network Contributor"
-	az role assignment create --assignee $(AZURE_OBJECT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP_MC) --role "Managed Identity Operator"
-	az role assignment create --assignee $(AZURE_OBJECT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP)    --role "Network Contributor" # in some case we create vnet here
+	# Note (charliedmcb): need to be principalId for E2E workflow as the pipeline identity doesn't have permissions to "query Graph API"
+	$(eval KARPENTER_USER_ASSIGNED_CLIENT_ID=$(shell az identity show --resource-group "${AZURE_RESOURCE_GROUP}" --name "${AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME}" --query 'principalId' -otsv))
+	az role assignment create --assignee $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP_MC) --role "Virtual Machine Contributor"
+	az role assignment create --assignee $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP_MC) --role "Network Contributor"
+	az role assignment create --assignee $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP_MC) --role "Managed Identity Operator"
+	az role assignment create --assignee $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --scope /subscriptions/$(AZURE_SUBSCRIPTION_ID)/resourceGroups/$(AZURE_RESOURCE_GROUP)    --role "Network Contributor" # in some case we create vnet here
 	@echo Consider "make az-patch-skaffold"!
 
 az-perm-acr:
-	$(eval AZURE_CLIENT_ID=$(shell az aks show --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) | jq  -r ".identityProfile.kubeletidentity.clientId"))
+	$(eval KARPENTER_USER_ASSIGNED_CLIENT_ID=$(shell az identity show --resource-group "${AZURE_RESOURCE_GROUP}" --name "${AZURE_KARPENTER_USER_ASSIGNED_IDENTITY_NAME}" --query 'principalId' -otsv))
 	$(eval AZURE_ACR_ID=$(shell    az acr show --name $(AZURE_ACR_NAME)     --resource-group $(AZURE_RESOURCE_GROUP) | jq  -r ".id"))
-	az role assignment create --assignee $(AZURE_CLIENT_ID) --scope $(AZURE_ACR_ID) --role "AcrPull"
+	az role assignment create --assignee $(KARPENTER_USER_ASSIGNED_CLIENT_ID) --scope $(AZURE_ACR_ID) --role "AcrPull"
 
 az-aks-check-acr:
 	az aks check-acr --name $(AZURE_CLUSTER_NAME) --resource-group $(AZURE_RESOURCE_GROUP) --acr $(AZURE_ACR_NAME)
